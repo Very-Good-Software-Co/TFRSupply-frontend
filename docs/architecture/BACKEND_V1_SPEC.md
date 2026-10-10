@@ -13,7 +13,7 @@ This repository is a static SPA (Caddy on Railway) with **no backend**. Shopify 
 | D1 | Build a real backend service (this spec). | Reverses the roadmap's v1.0 anti-scope line "do not build a backend". `docs/MASTER_EXECUTION_PROGRAM.md` must be amended when slice 0 lands. |
 | D2 | v1 scope: **quotes + admin queue, real admin auth, customer accounts / logged-in state, Fleet Workspace persistence.** | Four capabilities, sliced in §6. |
 | D3 | Lives in this repo under `server/`, deployed as a **second Railway service** alongside the unchanged static front-end service. | Shared contracts, one CI, one PR flow. |
-| D4 | Customers sign in with **Shopify Customer Accounts** (hosted login). | We never store customer passwords. Details gated on verification (§5, S3). |
+| D4 | Customers sign in with **Shopify Customer Accounts** (hosted login). | We never store customer passwords; the backend is a Shopify confidential client (§5.2). |
 | D5 | **Launch runs in parallel.** The storefront launch list in `docs/MASTER_EXECUTION_PROGRAM.md` does not depend on this backend. | Every slice must keep guest/signed-out behavior working exactly as today. |
 
 ## 2. Principles
@@ -133,17 +133,32 @@ Then 409
 
 **Today.** `AuthContext.tsx` is a constant: `MOCK_USER {id:'mock-user', email:'demo@tfrsupply.com', role:'admin'}`, `isAuthenticated: true` always; every method is a no-op. Real consumers are few: `App.jsx` (loading/error gates), `lib/PageNotFound.jsx` (reads `user.role === 'admin'`), and an **unused** `ProtectedRoute.jsx`. The four `Login/Register/ForgotPassword/ResetPassword.tsx` pages are unrouted; their legacy `.jsx` twins import a non-existent `@/api/base44Client` and are dead. Cart, fleet, quotes and checkout do **not** read customer auth today, so the blast radius of making it real is small.
 
-**Design (intent).**
-1. The SPA runs Shopify's hosted customer login (OAuth 2.0 authorization-code + PKCE — *to be verified*).
-2. SPA sends the resulting credential to `POST /api/auth/shopify`; the server **verifies it with Shopify**, upserts a `customers` row keyed by Shopify customer id, and issues its own first-party session cookie.
-3. `AuthProvider` becomes real: `GET /api/me` → `{isAuthenticated, user}`. `login()`/`logout()`/`navigateToLogin()` map to the hosted flow; `register`, `verifyOtp`, `resendOtp`, `requestPasswordReset`, `resetPassword`, `loginWithGoogle` are removed (Shopify owns all of it) and the four unrouted pages are deleted rather than routed.
-4. `user.role === 'admin'` in `PageNotFound` is reconciled: customer sessions never carry admin.
+**Design (verified against Shopify's documentation on 2026-10-10).** Sources: `shopify.dev/docs/storefronts/headless/building-with-the-customer-account-api/getting-started`, `.../checkout-authentication`, and the Customer Account API reference `shopify.dev/docs/api/customer`.
 
-**UNVERIFIED — blocked, do not build on these until read from source** (this environment's network policy denied `shopify.dev`): required Shopify admin configuration (headless channel, callback/JS-origin/logout URIs); public vs confidential client; **domain requirements between the storefront and the customer-account domain**; how a backend verifies a customer (token introspection vs calling the Customer Account API); rate limits.
+1. **The backend is a confidential client.** Shopify describes confidential clients as applications "that have a back-end to perform the authorization request and a server-side session to hold the refresh token". That is this backend, in a backend-for-frontend arrangement. The SPA never handles Shopify tokens.
+   - `GET /api/auth/login` — generates `state` and `nonce`, redirects to the discovered `authorization_endpoint` with `scope=openid email customer-account-api:full`, `response_type=code`, `redirect_uri`.
+   - `GET /api/auth/callback` — verifies `state`; exchanges the code at the `token_endpoint` using the client id/secret; validates the returned `id_token` (signature via the discovered `jwks_uri`, and the `nonce`); stores the access and refresh tokens **server-side only**; upserts a `customers` row keyed by Shopify customer id (read via the Customer Account API); sets our own first-party session cookie.
+   - Endpoints are **discovered at runtime** from `https://{shopDomain}/.well-known/openid-configuration` and `/.well-known/customer-account-api`, not hard-coded (Shopify's own guidance).
+   - `GET /api/me` → `{isAuthenticated, user}` drives `AuthProvider`. Logout redirects to the `end_session_endpoint` with `id_token_hint`.
+2. **`AuthProvider` becomes real.** `login()`/`logout()`/`navigateToLogin()` map to the routes above. `register`, `verifyOtp`, `resendOtp`, `requestPasswordReset`, `resetPassword` and `loginWithGoogle` are removed (Shopify owns all of it) and the four unrouted pages are deleted, not routed. `PageNotFound`'s `user.role === 'admin'` check is reconciled; customer sessions never carry admin.
+3. **Logged-in checkout.** Shopify documents two ways to carry a signed-in buyer into checkout: set a `customerAccessToken` on the cart with `cartBuyerIdentityUpdate`, or append `sso=silent` to the `checkoutUrl` (which needs the buyer's active browser session on the Customer Accounts domain plus periodic `prompt=none` refresh; if that session lapses, checkout silently becomes a guest checkout). **Recommended: the cart-identity route, performed server-side** — `POST /api/checkout/identify {cartId}` calls `cartBuyerIdentityUpdate` with the stored customer token, so the token stays off the browser. The SPA keeps creating carts exactly as it does today and calls this only when signed in; guests are untouched. Shopify notes the cart must be updated again after any token refresh, and that customer-account pages such as order history may still ask the buyer to log in separately.
 
-**Hard prerequisite — domain topology (§10 D-domain).** The Shopify store's primary domain is `tfrsupply.com` (Matrixify connection) while the React app currently has only `tfrsupply-frontend-production.up.railway.app` and no custom domain. Where the React storefront will live relative to `tfrsupply.com` and Shopify's checkout/account domains must be decided before S3 — it likely determines whether hosted customer login can work at all.
+**Shopify-side setup (admin actions, from the getting-started guide).**
+1. Settings → Customer accounts → under "Accounts in online store and checkout", choose **Customer accounts**.
+2. Install the **Headless** sales channel; open its **Customer Account API settings**.
+3. Choose **Confidential client**; copy the client ID and secret into Railway secrets (never `VITE_`-prefixed).
+4. Register **Callback URL(s)** — Shopify requires **HTTPS** and does **not** support `localhost` or any `http` URL (use a tunnel for local development, and register the staging environment's URL separately); optional Logout URL.
 
-**Acceptance (provisional).** Signed-out visitors browse, cart and check out exactly as today; signed-in state is real and survives reload; sign-out ends the session server-side; no customer password ever touches our code or logs.
+**What the docs say about domains.** Discovery runs "on the storefront domain", and customer accounts "persist customer logins across online store, Hydrogen, and checkout". The pages read state **no requirement that a headless storefront share a root domain with Shopify's account domain**, and the cart-identity route above does not depend on a browser cookie shared with that domain. So a `railway.app` HTTPS URL is, on this evidence, registrable as a callback. That is the absence of a stated requirement in the pages read, not a guarantee — confirm in staging before relying on it.
+
+**Rate limits (reference).** 100 points/second on the standard plan (200 on Advanced/Plus); 3,000 requests/minute per customer shared across all apps; over-limit returns `THROTTLED` / HTTP 429 with `Retry-After`. Not a constraint at expected volume.
+
+**Still unverified** (verify in the staging environment; do not assume):
+- (a) That the Customer Account API `access_token` is accepted as the `customerAccessToken` in the Storefront API's `cartBuyerIdentityUpdate` — the checkout-authentication page implies it, but the Storefront API reference was not read.
+- (b) That Customer accounts and the Headless channel are enabled/installed on the `tfrsupply.com` store — not visible from this environment.
+- (c) How pre-existing legacy customer records on that store behave at first sign-in.
+
+**Acceptance.** Signed-out visitors browse, cart and check out exactly as today; signing in produces a real session that survives reload; sign-out ends the session server-side and calls Shopify's logout; no Shopify token or customer credential is ever sent to, stored in, or logged by the browser; a signed-in checkout arrives at Shopify identified as that customer (staging test, covers (a)); when the Shopify session or token lapses the user falls back to guest behavior with a clear signed-out state, never an error loop.
 
 ### 5.3 S4 — Fleet Workspace persistence
 
@@ -171,7 +186,7 @@ Then 409
 | **S0** Foundations | `server/` skeleton, `shared/contracts`, Railway service #2 + Postgres, `/api/health`, Caddy `/api` proxy, CI job (lint/typecheck/test/build for server + Postgres service container), env/secret handling, structured logging, migration runner | §10 D-stack confirmed | 1–2 days |
 | **S1** Quotes + admin queue | §4 | S0 merged | 2–3 days |
 | **S2** Admin auth | §5.1 | S1 merged | 2–3 days |
-| **S3** Customer identity | §5.2 | S2 merged **and** D-domain decided **and** Shopify docs verified | 3–4 days |
+| **S3** Customer identity | §5.2 | S2 merged **and** Shopify admin setup done (§5.2) **and** the staging environment exists (callback URL + the (a)–(c) checks need it) | 3–4 days |
 | **S4a** Fleet storage port | behavior-identical refactor of the 5 Contexts, no server | none (can run any time; no backend dependency) | 2–3 days |
 | **S4b** Fleet server persistence + import | §5.3 server side + `httpAdapter` | S3 merged and S4a merged | 4–6 days |
 
@@ -205,8 +220,8 @@ Structured JSON logs with request ids; `/api/health` (liveness) and `/api/ready`
 |---|---|---|---|
 | D-stack | Confirm Node/Fastify/Zod/Postgres/plain-SQL migrations (§3.2) | S0 | Accept as written |
 | D-email | Provider for outbound quote-notification email (and later account mail) | S1 | Pick one transactional provider; until then admin queue is the only notice |
-| D-domain | Where the React storefront lives relative to `tfrsupply.com`, Shopify checkout and the customer-account domain | S3 | Decide before S3; likely a custom subdomain for the storefront |
-| D-shopify | Read Shopify Customer Accounts docs (needs `shopify.dev` allowed in the environment's network policy) | S3 | Do first |
+| D-domain | Production domain for the React storefront (`tfrsupply.com` is the Shopify store's primary domain; the app has only a `railway.app` URL). **Not a Shopify prerequisite per the docs read** (§5.2), but still needed for production: callback URL, cookie origin, brand | production launch (not S3) | Decide before go-live; likely a custom subdomain |
+| D-shopify | ~~Read Shopify Customer Accounts docs~~ **Done 2026-10-10** (§5.2). Residual unknowns (a)–(c) are verified in staging | — | — |
 | D-mfa | MFA for `super-admin` in v1 | S2 | Yes for super-admin; defer others |
 | D-retention | Quote data retention period; privacy-policy wording | S1 | Set a period (e.g. 24 months) and state it |
 | D-spam | CAPTCHA on public quote POST vs honeypot + rate limit only | S1 | Start with rate limit + honeypot; add CAPTCHA if abused |
