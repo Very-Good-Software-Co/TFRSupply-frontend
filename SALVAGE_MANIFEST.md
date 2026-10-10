@@ -1,5 +1,7 @@
 # TFRSupply Frontend — Forensic Salvage Manifest
 
+> **Status (2026-10-10): the stack rewrite this document was written for is NOT happening.** On 2026-10-10 the decision was made to launch the *existing* application rather than rewrite it (see `docs/MASTER_EXECUTION_PROGRAM.md` for the active launch plan). This manifest is retained as **reference documentation only** — a cited code map of the domain logic, salvageable assets, and known traps as of the 2026-08-14 tree. Treat Section 4 ("Blueprint for the New Build") as historical, not as a plan. Citations are to the Aug-14 tree and may have drifted; verify against current `main` before relying on any `file:line`.
+
 **Purpose:** A cited, evidence-based extraction of business logic, data contracts, and edge-case knowledge from this repository ahead of a stack rewrite. Every claim below is either cited to a `file:line` in the current tree (commit range ending 2026-08-14, branch `claude/code-review-automated-agents-m3cvl8`) or explicitly marked as inference/proposal. Where a `docs/architecture/*.md` file made a claim, it was cross-checked against the actual source it describes rather than trusted at face value — two cases where the doc was stale or self-corrected are called out explicitly in Section 3.
 
 ## Scope boundary (read this first)
